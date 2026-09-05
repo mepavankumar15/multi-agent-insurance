@@ -97,7 +97,17 @@ st.markdown("""
 
     /* Sidebar styling */
     section[data-testid="stSidebar"] {
-        background: #f0f2f6;
+        background: #000000;
+        color: #ffffff;
+    }
+    
+    section[data-testid="stSidebar"] h1, 
+    section[data-testid="stSidebar"] h2, 
+    section[data-testid="stSidebar"] h3, 
+    section[data-testid="stSidebar"] p, 
+    section[data-testid="stSidebar"] div,
+    section[data-testid="stSidebar"] span {
+        color: #ffffff !important;
     }
 
     /* Metric cards */
@@ -108,7 +118,7 @@ st.markdown("""
     }
     .metric-card {
         flex: 1;
-        background: white;
+        background: black;
         border: 1px solid #e2e8f0;
         border-radius: 10px;
         padding: 1rem;
