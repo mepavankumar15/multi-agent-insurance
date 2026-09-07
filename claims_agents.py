@@ -109,6 +109,14 @@ class ClaimState(TypedDict, total=False):
     # Trace log (every agent appends here)
     trace: list[str]
 
+    # Added for exclusion checking and app form state
+    exclusion_check: dict
+    treatment_date: str
+    coverage_start_date: str
+    benefit_type: str
+    submission_deadline_exceeded: bool
+    structured_claim: dict
+
 
 # ---------------------------------------------------------------------------
 # LLM helper
@@ -252,6 +260,13 @@ def intake_agent(state: ClaimState) -> dict:
 # 2. PolicyValidationAgent
 # ---------------------------------------------------------------------------
 
+_policy_collection = None
+
+def set_chroma_collection(collection):
+    """Store the ingested policy VectorCollection for the exclusion agent."""
+    global _policy_collection
+    _policy_collection = collection
+
 def policy_validation_agent(state: ClaimState) -> dict:
     """Validate claim against mock policy database."""
     trace = list(state.get("trace", []))
@@ -380,12 +395,15 @@ def fraud_detection_agent(state: ClaimState) -> dict:
     trace = list(state.get("trace", []))
     trace.append("[FraudDetectionAgent] Analysing claim for fraud indicators")
 
+    today_str = datetime.now().strftime("%Y-%m-%d")
     system_prompt = (
         "You are an insurance fraud detection specialist. Analyse the claim data below "
         "and return ONLY a JSON object with these keys:\n"
         "- fraud_score: integer 0-100 (0=no risk, 100=certain fraud)\n"
         "- red_flags: list of short strings describing risk indicators\n"
         "- fraud_reasoning: 1-2 sentence explanation\n\n"
+        f"Today's date is {today_str}. Use this to correctly assess whether dates "
+        "are in the past or future.\n\n"
         "Look for: policy invalid/lapsed, amount near or exceeding coverage limit, "
         "urgency or pressure language, missing documentation, unclear dates, "
         "inconsistencies between description and claim details."
@@ -445,6 +463,8 @@ def route_claim(state: ClaimState) -> str:
     claim_amount = state.get("claim_amount", 0)
     coverage_limit = state.get("coverage_limit", float("inf"))
     policy_found = state.get("policy_found", True)
+    excluded = state.get("exclusion_check", {}).get("excluded", False)
+    deadline_exceeded = state.get("submission_deadline_exceeded", False)
 
     if fraud_score >= 60:
         return "senior_review"
@@ -452,11 +472,149 @@ def route_claim(state: ClaimState) -> str:
         return "senior_review"
     if claim_amount > coverage_limit:
         return "senior_review"
+    if excluded:
+        return "senior_review"
+    if deadline_exceeded:
+        return "senior_review"
     return "auto_approve"
 
 
 # ---------------------------------------------------------------------------
-# 5. DecisionAgent
+# 5. ExclusionMatchAgent
+# ---------------------------------------------------------------------------
+
+def _fallback_exclusion_match(claim_desc: str, retrieved_clauses: list[dict]) -> dict:
+    """TF-IDF fallback for exclusion matching."""
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+        
+        texts = [claim_desc] + [c["text"] for c in retrieved_clauses]
+        vectorizer = TfidfVectorizer(stop_words='english')
+        tfidf_matrix = vectorizer.fit_transform(texts)
+        
+        # Similarities of claim_desc (index 0) with clauses (index 1 to N)
+        cosine_sims = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
+        
+        max_idx = cosine_sims.argmax()
+        max_sim = cosine_sims[max_idx]
+        
+        if max_sim > 0.25:
+            matched = retrieved_clauses[max_idx]
+            # Try to extract clause number
+            clause_num = None
+            import re
+            m = re.match(r'^(\d+)\.', matched["text"])
+            if m:
+                clause_num = int(m.group(1))
+                
+            return {
+                "excluded": True,
+                "matched_clause_number": clause_num,
+                "matched_clause_text": matched["text"],
+                "reasoning": f"Heuristic match (similarity: {max_sim:.2f}) with exclusion clause.",
+                "method": "rule_based"
+            }
+    except Exception:
+        pass
+        
+    return {
+        "excluded": False,
+        "matched_clause_number": None,
+        "matched_clause_text": None,
+        "reasoning": "No strong heuristic match found.",
+        "method": "rule_based"
+    }
+
+def exclusion_match_agent(state: ClaimState) -> dict:
+    trace = list(state.get("trace", []))
+    trace.append("[ExclusionMatchAgent] Checking for policy exclusions")
+    
+    if _policy_collection is None:
+        trace.append("[ExclusionMatchAgent] No policy PDF ingested, skipping exclusion check")
+        return {
+            "exclusion_check": {
+                "excluded": False,
+                "matched_clause_number": None,
+                "matched_clause_text": None,
+                "reasoning": "No policy document loaded",
+                "method": "skipped"
+            },
+            "trace": trace
+        }
+        
+    desc = state.get("description", "")
+    if not desc:
+        desc = state.get("structured_claim", {}).get("description", "")
+        
+    try:
+        from retriever import retrieve_relevant_clauses
+        clauses = retrieve_relevant_clauses(_policy_collection, desc, section_type="exclusion", k=5)
+    except Exception as e:
+        trace.append(f"[ExclusionMatchAgent] Retrieval failed: {e}")
+        return {"trace": trace}
+        
+    if not clauses:
+        trace.append("[ExclusionMatchAgent] No exclusions retrieved")
+        return {
+            "exclusion_check": {
+                "excluded": False,
+                "matched_clause_number": None,
+                "matched_clause_text": None,
+                "reasoning": "No exclusions found in document.",
+                "method": "rule_based"
+            },
+            "trace": trace
+        }
+        
+    clauses_text = "\n\n".join([f"Clause: {c['text']}" for c in clauses])
+    
+    system_prompt = (
+        "You are an insurance claims exclusion checker. "
+        "Given the retrieved policy exclusion clauses and the claim description, "
+        "determine if any exclusion applies. "
+        "Respond with ONLY a JSON object: excluded (bool), matched_clause_number (int or null), "
+        "matched_clause_text (string or null), reasoning (1-2 sentences)."
+    )
+    user_prompt = f"Retrieved Clauses:\n{clauses_text}\n\nClaim Description:\n{desc}"
+    
+    result = None
+    llm_response = _llm_call(system_prompt, user_prompt)
+    if llm_response:
+        try:
+            import re
+            cleaned = re.sub(r"```(?:json)?\s*", "", llm_response).strip().rstrip("`")
+            result = json.loads(cleaned)
+            result["method"] = "grok"
+            trace.append("[ExclusionMatchAgent] LLM exclusion check successful")
+        except Exception:
+            trace.append("[ExclusionMatchAgent] LLM parse failed, using fallback")
+            result = None
+            
+    if result is None:
+        result = _fallback_exclusion_match(desc, clauses)
+        trace.append("[ExclusionMatchAgent] Used rule-based fallback")
+        
+    if result.get("excluded"):
+        trace.append(f"[ExclusionMatchAgent] Claim EXCLUDED by clause: {result.get('matched_clause_number')}")
+    else:
+        trace.append("[ExclusionMatchAgent] Claim not excluded by policy.")
+        
+    return {
+        "exclusion_check": result,
+        "trace": trace
+    }
+
+def route_after_exclusion(state: ClaimState) -> str:
+    """Route based on exclusion result."""
+    if state.get("exclusion_check", {}).get("excluded", False):
+        return "senior_review"
+    if state.get("submission_deadline_exceeded", False):
+        return "senior_review"
+    return "fraud_detection"
+
+# ---------------------------------------------------------------------------
+# 6. DecisionAgent
 # ---------------------------------------------------------------------------
 
 def decision_agent(state: ClaimState) -> dict:
@@ -503,6 +661,10 @@ def senior_review_agent(state: ClaimState) -> dict:
             f"Claim amount ${state.get('claim_amount', 0):,.2f} exceeds "
             f"coverage limit ${state.get('coverage_limit', 0):,.2f}"
         )
+    if state.get("exclusion_check", {}).get("excluded"):
+        triggers.append(f"Policy exclusion applies: Clause {state['exclusion_check'].get('matched_clause_number')}")
+    if state.get("submission_deadline_exceeded", False):
+        triggers.append("Submission deadline (90 days) exceeded")
     if not triggers:
         triggers.append("Escalated for manual review")
 
@@ -643,6 +805,7 @@ def build_graph() -> StateGraph:
     # Add nodes
     graph.add_node("intake", intake_agent)
     graph.add_node("policy_validation", policy_validation_agent)
+    graph.add_node("exclusion_check", exclusion_match_agent)
     graph.add_node("fraud_detection", fraud_detection_agent)
     graph.add_node("decision", decision_agent)
     graph.add_node("senior_review", senior_review_agent)
@@ -651,7 +814,17 @@ def build_graph() -> StateGraph:
     # Linear edges
     graph.set_entry_point("intake")
     graph.add_edge("intake", "policy_validation")
-    graph.add_edge("policy_validation", "fraud_detection")
+    graph.add_edge("policy_validation", "exclusion_check")
+    
+    # Conditional routing after exclusion
+    graph.add_conditional_edges(
+        "exclusion_check",
+        route_after_exclusion,
+        {
+            "fraud_detection": "fraud_detection",
+            "senior_review": "senior_review",
+        },
+    )
 
     # Conditional routing after fraud detection
     graph.add_conditional_edges(
@@ -682,7 +855,7 @@ def compile_graph():
 # Convenience function
 # ---------------------------------------------------------------------------
 
-def process_claim(raw_text: str) -> ClaimState:
+def process_claim(raw_text: str, initial_data: dict = None) -> ClaimState:
     """
     Process a raw claim text through the full agent pipeline.
 
@@ -693,6 +866,9 @@ def process_claim(raw_text: str) -> ClaimState:
         "raw_text": raw_text,
         "trace": [f"[System] Claim received at {datetime.now().isoformat()}"],
     }
+    if initial_data:
+        initial_state.update(initial_data)
+        
     result = app.invoke(initial_state)
     return result
 

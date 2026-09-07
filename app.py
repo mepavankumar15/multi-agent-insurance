@@ -12,7 +12,13 @@ from claims_agents import (
     SAMPLE_CLAIMS,
     process_claim,
     build_graph,
+    compile_graph,
+    set_chroma_collection,
 )
+from ingest import ingest_policy_pdf
+from datetime import date, datetime
+import tempfile
+import os
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -155,6 +161,26 @@ st.markdown("""
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
+    st.markdown("## Policy Configuration")
+    uploaded_file = st.file_uploader("Upload Policy PDF", type=["pdf"])
+    if uploaded_file is not None:
+        if "chroma_collection" not in st.session_state:
+            with st.spinner("Ingesting policy PDF..."):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(uploaded_file.getvalue())
+                    tmp_path = tmp.name
+                
+                collection, summary = ingest_policy_pdf(tmp_path)
+                st.session_state["chroma_collection"] = collection
+                st.session_state["ingest_summary"] = summary
+                
+                os.remove(tmp_path)
+                
+        set_chroma_collection(st.session_state["chroma_collection"])
+        summary = st.session_state["ingest_summary"]
+        st.success(f"Indexed {summary.get('exclusion', 0)} exclusion clauses, {summary.get('procedure', 0)} procedure sections, {summary.get('definition', 0)} definitions")
+    
+    st.markdown("---")
     st.markdown("## Sample Claims")
     st.caption("Click to load a sample claim into the input area.")
 
@@ -194,29 +220,114 @@ with st.sidebar:
 # Main area  --  claim input
 # ---------------------------------------------------------------------------
 
-default_text = st.session_state.get("claim_input", "")
+input_tab1, input_tab2 = st.tabs(["📝 Manual Entry", "📄 Raw Text"])
 
-claim_text = st.text_area(
-    "Enter raw claim text:",
-    value=default_text,
-    height=180,
-    placeholder=(
-        "Claimant: Jane Doe. Policy: POL-10234. Auto claim. "
-        "Incident date 2026-08-01. Amount: $4,500. "
-        "My car was rear-ended at a stoplight..."
-    ),
-)
+with input_tab1:
+    st.markdown("### Claim Details")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        claimant_name = st.text_input("Claimant Name", value="Jane Doe")
+        membership_number = st.text_input("Membership / Policy Number", value="POL-10234")
+        benefit_type = st.selectbox("Benefit Type", ["Hospital & Surgical", "SMM", "Clinical", "Maternity", "Dental", "Network Dental"])
+        bhn_card = st.radio("BHN Card", ["Using BHN Card", "Not using BHN Card"])
+    with col_b:
+        treatment_date = st.date_input("Date of Treatment / Discharge", value=date(2026, 8, 1))
+        coverage_start_date = st.date_input("Coverage / Membership Start Date", value=date(2025, 1, 1))
+        claim_amount = st.number_input("Claim Amount (HKD)", min_value=0.0, step=100.0, value=4500.0)
+        
+    diagnosis = st.text_area("Diagnosis / Description", height=100)
+    st.markdown("### Document Checklist")
+    col_c, col_d = st.columns(2)
+    with col_c:
+        orig_receipt = st.checkbox("Original Receipt")
+        referral = st.checkbox("Referral Letter")
+    with col_d:
+        pre_auth = st.checkbox("Pre-authorisation Confirmation")
+        discharge_summary = st.checkbox("Discharge Summary")
+        
+    process_manual_btn = st.button("🚀 Process Manual Claim", type="primary", use_container_width=True)
 
-process_btn = st.button("🚀 Process Claim", type="primary", use_container_width=True)
+with input_tab2:
+    default_text = st.session_state.get("claim_input", "")
+    claim_text = st.text_area(
+        "Enter raw claim text:",
+        value=default_text,
+        height=180,
+        placeholder=(
+            "Claimant: Jane Doe. Policy: POL-10234. Auto claim. "
+            "Incident date 2026-08-01. Amount: $4,500. "
+            "My car was rear-ended at a stoplight..."
+        ),
+    )
+    process_raw_btn = st.button("🚀 Process Raw Text Claim", type="primary", use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
 # Processing & output
 # ---------------------------------------------------------------------------
 
-if process_btn and claim_text.strip():
-    with st.spinner("Processing claim through 6-agent pipeline..."):
-        result = process_claim(claim_text.strip())
+claim_to_process = None
+initial_data = {}
+
+if process_manual_btn:
+    # 90-day check
+    deadline_exceeded = (date.today() - treatment_date).days > 90
+    
+    claim_to_process = (
+        f"Claimant: {claimant_name}. Policy: {membership_number}. "
+        f"Benefit: {benefit_type}. Date: {treatment_date.isoformat()}. Amount: ${claim_amount}. "
+        f"Diagnosis: {diagnosis}"
+    )
+    
+    initial_data = {
+        "treatment_date": treatment_date.isoformat(),
+        "coverage_start_date": coverage_start_date.isoformat(),
+        "benefit_type": benefit_type,
+        "submission_deadline_exceeded": deadline_exceeded,
+        "structured_claim": {
+            "claimant_name": claimant_name,
+            "policy_number": membership_number,
+            "claim_amount": claim_amount,
+            "description": diagnosis,
+            "incident_date": treatment_date.isoformat(),
+            "claim_type": "health"
+        }
+    }
+    
+elif process_raw_btn and claim_text.strip():
+    claim_to_process = claim_text.strip()
+    
+if claim_to_process:
+    if initial_data.get("submission_deadline_exceeded"):
+        st.warning("⚠️ Submission deadline (90 days) has been exceeded.")
+        
+    result = None
+    app_graph = compile_graph()
+    
+    initial_state = {
+        "raw_text": claim_to_process,
+        "trace": [f"[System] Claim received at {datetime.now().isoformat()}"],
+    }
+    if initial_data:
+        initial_state.update(initial_data)
+
+    result = dict(initial_state)
+    progress_bar = st.progress(0, text="Starting agent pipeline...")
+    step_count = 0
+    total_steps = 6
+
+    with st.status("Evaluating Claim Pipeline...", expanded=True) as status:
+        for output in app_graph.stream(initial_state):
+            for node_name, node_state in output.items():
+                st.write(f"⚙️ Completed **{node_name}** agent")
+                step_count += 1
+                prog = min(step_count / total_steps, 1.0)
+                progress_bar.progress(prog, text=f"Agent completed: {node_name}...")
+                result.update(node_state)
+        
+        status.update(label="Evaluation Complete!", state="complete", expanded=False)
+    
+    progress_bar.progress(1.0, text="Done!")
 
     st.success("Pipeline completed successfully!")
 
@@ -236,9 +347,10 @@ if process_btn and claim_text.strip():
         st.metric("Decision", decision_status.upper())
 
     # ---- Tabbed output ----
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab_excl, tab3, tab4, tab5, tab6 = st.tabs([
         "📥 Intake",
         "📋 Policy Check",
+        "🛑 Exclusion Match",
         "🔍 Fraud Detection",
         "⚖️ Decision",
         "✉️ Letter",
@@ -272,6 +384,23 @@ if process_btn and claim_text.strip():
             st.success("Policy is valid and coverage matches the claim type.")
         else:
             st.error(result.get("policy_notes", "Policy validation failed."))
+
+    with tab_excl:
+        st.subheader("Exclusion Match Agent")
+        exc_data = result.get("exclusion_check", {})
+        
+        excluded = exc_data.get("excluded", False)
+        if excluded:
+            st.error("Claim EXCLUDED by policy.")
+        else:
+            st.success("Claim NOT excluded by policy.")
+            
+        st.markdown(f"**Method used:** {exc_data.get('method', 'unknown')}")
+        st.markdown(f"**Reasoning:** {exc_data.get('reasoning', 'N/A')}")
+        
+        if exc_data.get("matched_clause_text"):
+            with st.expander(f"Matched Clause {exc_data.get('matched_clause_number', '')}"):
+                st.info(exc_data.get("matched_clause_text"))
 
     with tab3:
         st.subheader("Fraud Detection Agent")
@@ -348,5 +477,5 @@ if process_btn and claim_text.strip():
                 icon = "🔹"
             st.text(f"{icon} {i:02d}. {entry}")
 
-elif process_btn:
+elif process_raw_btn:
     st.warning("Please enter claim text before processing.")

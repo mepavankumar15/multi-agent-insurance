@@ -5,3 +5,8 @@ langchain-core
 python-dotenv
 nbconvert
 ipykernel
+chromadb
+sentence-transformers
+pdfplumber
+scikit-learn
+python-dateutil
