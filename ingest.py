@@ -301,3 +301,101 @@ def ingest_policy_pdf(file_path: str) -> Tuple[VectorCollection, dict]:
             summary[t] += 1
 
     return collection, summary
+
+
+def extract_policy_metadata(pdf_path: str) -> dict:
+    """
+    Lightweight metadata extractor for uploaded policy PDFs.
+    Uses pdfplumber + regex fallback. Safe, non-breaking addition.
+    Returns a dict with: policy_number, holder, status, coverage_type,
+    coverage_limit, deductible (or None if not found).
+    """
+    try:
+        import pdfplumber
+        import re
+
+        text = ""
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages[:4]:  # first 4 pages usually have the summary
+                page_text = page.extract_text() or ""
+                text += page_text + "\n"
+
+        text_lower = text.lower()
+
+        result = {
+            "policy_number": None,
+            "holder": None,
+            "status": "active",
+            "coverage_type": None,
+            "coverage_limit": None,
+            "deductible": None,
+            "raw_text_sample": text[:800],
+        }
+
+        # Policy number patterns
+        pol_patterns = [
+            r"(?:policy|certificate|contract)\s*(?:no\.?|number|#)?\s*[:\-]?\s*([A-Z]{2,4}[\-\s]?\d{4,6})",
+            r"(POL\-\d{4,6})",
+        ]
+        for pat in pol_patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                result["policy_number"] = m.group(1).upper().replace(" ", "")
+                break
+
+        # Holder name (common patterns)
+        holder_patterns = [
+            r"(?:insured|policyholder|holder|name)\s*[:\-]\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,3})",
+            r"([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,3})\s*(?:\(the insured|\(policyholder)",
+        ]
+        for pat in holder_patterns:
+            m = re.search(pat, text)
+            if m:
+                result["holder"] = m.group(1).strip()
+                break
+
+        # Coverage type
+        if any(k in text_lower for k in ["auto", "motor", "vehicle", "car"]):
+            result["coverage_type"] = "auto"
+        elif any(k in text_lower for k in ["home", "property", "household", "building"]):
+            result["coverage_type"] = "home"
+        elif any(k in text_lower for k in ["health", "medical", "hospital", "surgical", "clinical"]):
+            result["coverage_type"] = "health"
+
+        # Coverage limit
+        limit_match = re.search(r"(?:limit|sum insured|coverage limit)[^\d]{0,20}(\$?\s*[\d,]+(?:\.\d{2})?)", text, re.IGNORECASE)
+        if limit_match:
+            try:
+                val = float(limit_match.group(1).replace("$", "").replace(",", "").strip())
+                result["coverage_limit"] = val
+            except:
+                pass
+
+        # Deductible
+        ded_match = re.search(r"(?:deductible|excess)[^\d]{0,20}(\$?\s*[\d,]+(?:\.\d{2})?)", text, re.IGNORECASE)
+        if ded_match:
+            try:
+                val = float(ded_match.group(1).replace("$", "").replace(",", "").strip())
+                result["deductible"] = val
+            except:
+                pass
+
+        # Status
+        if "lapsed" in text_lower or "expired" in text_lower or "cancelled" in text_lower:
+            result["status"] = "lapsed"
+        elif "suspended" in text_lower:
+            result["status"] = "suspended"
+
+        return result
+
+    except Exception as e:
+        print(f"[extract_policy_metadata] Error: {e}")
+        return {
+            "policy_number": None,
+            "holder": None,
+            "status": "active",
+            "coverage_type": None,
+            "coverage_limit": None,
+            "deductible": None,
+            "error": str(e),
+        }

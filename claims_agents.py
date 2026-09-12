@@ -273,10 +273,11 @@ def intake_agent(state: ClaimState) -> dict:
             trace.append("[IntakeAgent] Used rule-based fallback extraction")
 
     # Merge with manual form fields if provided in state (from structured_claim)
+    # Always prefer manual structured_claim values (they are the source of truth for the form)
     manual_fields = state.get("structured_claim", {})
     if manual_fields:
         for k, v in manual_fields.items():
-            if v and (result.get(k) in [None, "Unknown", "UNKNOWN", 0, 0.0, ""]):
+            if v:
                 result[k] = v
 
     # Normalise claim_amount to float
@@ -307,7 +308,7 @@ def set_chroma_collection(collection):
     _policy_collection = collection
 
 def policy_validation_agent(state: ClaimState) -> dict:
-    """Validate claim against mock policy database."""
+    """Validate claim against mock policy database (with hybrid PDF upload support)."""
     trace = list(state.get("trace", []))
     policy_number = state.get("policy_number", "UNKNOWN")
     claim_type = state.get("claim_type", "")
@@ -315,6 +316,35 @@ def policy_validation_agent(state: ClaimState) -> dict:
 
     trace.append(f"[PolicyValidationAgent] Looking up policy {policy_number}")
 
+    # NEW: Hybrid lookup — prefer uploaded policy PDF metadata if available
+    uploaded = state.get("uploaded_policy")
+    if uploaded and uploaded.get("policy_number") == policy_number:
+        trace.append("[PolicyValidationAgent] Using policy metadata from uploaded PDF")
+        status = uploaded.get("status", "active")
+        cov_type = uploaded.get("coverage_type") or claim_type
+        cov_limit = uploaded.get("coverage_limit") or 999999.0
+        coverage_valid = (status == "active") and (cov_type == claim_type)
+
+        notes_parts = []
+        if status != "active":
+            notes_parts.append(f"Policy is {status} (not active).")
+        if cov_type != claim_type:
+            notes_parts.append(f"Coverage type mismatch: policy='{cov_type}' vs claim='{claim_type}'.")
+        if claim_amount > cov_limit:
+            notes_parts.append(f"Claim amount ${claim_amount:,.2f} exceeds limit ${cov_limit:,.2f}.")
+        if not notes_parts:
+            notes_parts.append("Policy validated from uploaded document.")
+
+        return {
+            "policy_found": True,
+            "policy_status": status,
+            "coverage_valid": coverage_valid,
+            "coverage_limit": float(cov_limit),
+            "policy_notes": " ".join(notes_parts),
+            "trace": trace,
+        }
+
+    # Fallback: original mock database logic (unchanged)
     policy = MOCK_POLICIES.get(policy_number)
 
     if policy is None:

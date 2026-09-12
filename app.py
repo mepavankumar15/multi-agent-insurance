@@ -23,12 +23,12 @@ def get_claims_agents():
     return MOCK_POLICIES, SAMPLE_CLAIMS, process_claim, build_graph, compile_graph, set_chroma_collection
 
 def get_ingest():
-    from ingest import ingest_policy_pdf
-    return ingest_policy_pdf
+    from ingest import ingest_policy_pdf, extract_policy_metadata
+    return ingest_policy_pdf, extract_policy_metadata
 
 # Load the modules now (only once)
 MOCK_POLICIES, SAMPLE_CLAIMS, process_claim, build_graph, compile_graph, set_chroma_collection = get_claims_agents()
-ingest_policy_pdf = get_ingest()
+ingest_policy_pdf, extract_policy_metadata = get_ingest()
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +237,16 @@ with input_tab4:
                     collection, summary = ingest_policy_pdf(tmp_path)
                     st.session_state["chroma_collection"] = collection
                     st.session_state["ingest_summary"] = summary
+
+                    # NEW: also extract basic policy metadata for hybrid lookup
+                    try:
+                        policy_meta = extract_policy_metadata(tmp_path)
+                        if policy_meta.get("policy_number"):
+                            st.session_state["uploaded_policy"] = policy_meta
+                            st.info(f"ℹ️ Extracted policy {policy_meta['policy_number']} from PDF (will be used for validation).")
+                    except Exception:
+                        pass  # non-fatal
+
                     st.success(f"✅ Policy processed! {summary.get('exclusion', 0)} exclusions indexed.")
                 except Exception as e:
                     st.error(f"Failed to process policy: {e}")
@@ -387,7 +397,7 @@ if process_manual_btn:
     
     claim_to_process = (
         f"Claimant: {claimant_name}. Policy: {membership_number}. "
-        f"Benefit: {benefit_type}. Date: {treatment_date.isoformat()}. Amount: ${claim_amount}. "
+        f"Claim type: auto. Date: {treatment_date.isoformat()}. Amount: ${claim_amount}. "
         f"Diagnosis: {diagnosis}"
     )
     
@@ -402,8 +412,9 @@ if process_manual_btn:
             "claim_amount": claim_amount,
             "description": diagnosis,
             "incident_date": treatment_date.isoformat(),
-            "claim_type": "health"
-        }
+            "claim_type": "auto"
+        },
+        "uploaded_policy": st.session_state.get("uploaded_policy"),  # NEW: hybrid lookup
     }
     
 elif process_raw_btn and claim_text.strip():
@@ -423,6 +434,7 @@ elif process_receipt_btn:
         "treatment_date": ext_date.isoformat(),
         "coverage_start_date": date(2025, 1, 1).isoformat(), # mock
         "benefit_type": ext_benefit,
+        "uploaded_policy": st.session_state.get("uploaded_policy"),  # NEW: hybrid lookup
         "submission_deadline_exceeded": deadline_exceeded,
         "structured_claim": {
             "claimant_name": ext_claimant,
