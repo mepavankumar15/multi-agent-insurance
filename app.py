@@ -6,19 +6,30 @@ multi-agent pipeline results.
 
 import json
 import streamlit as st
-
-from claims_agents import (
-    MOCK_POLICIES,
-    SAMPLE_CLAIMS,
-    process_claim,
-    build_graph,
-    compile_graph,
-    set_chroma_collection,
-)
-from ingest import ingest_policy_pdf
-from datetime import date, datetime
 import tempfile
 import os
+from datetime import date, datetime
+
+# Lazy imports to make the app load faster
+def get_claims_agents():
+    from claims_agents import (
+        MOCK_POLICIES,
+        SAMPLE_CLAIMS,
+        process_claim,
+        build_graph,
+        compile_graph,
+        set_chroma_collection,
+    )
+    return MOCK_POLICIES, SAMPLE_CLAIMS, process_claim, build_graph, compile_graph, set_chroma_collection
+
+def get_ingest():
+    from ingest import ingest_policy_pdf
+    return ingest_policy_pdf
+
+# Load the modules now (only once)
+MOCK_POLICIES, SAMPLE_CLAIMS, process_claim, build_graph, compile_graph, set_chroma_collection = get_claims_agents()
+ingest_policy_pdf = get_ingest()
+
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -28,7 +39,7 @@ st.set_page_config(
     page_title="Insurance Claims Processor",
     page_icon="🛡️",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",   # Changed from expanded
 )
 
 # ---------------------------------------------------------------------------
@@ -160,27 +171,9 @@ st.markdown("""
 # Sidebar
 # ---------------------------------------------------------------------------
 
+# Sidebar removed (Policy Configuration was causing receipt upload issues)
+
 with st.sidebar:
-    st.markdown("## Policy Configuration")
-    uploaded_file = st.file_uploader("Upload Policy PDF", type=["pdf"])
-    if uploaded_file is not None:
-        if "chroma_collection" not in st.session_state:
-            with st.spinner("Ingesting policy PDF..."):
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    tmp.write(uploaded_file.getvalue())
-                    tmp_path = tmp.name
-                
-                collection, summary = ingest_policy_pdf(tmp_path)
-                st.session_state["chroma_collection"] = collection
-                st.session_state["ingest_summary"] = summary
-                
-                os.remove(tmp_path)
-                
-        set_chroma_collection(st.session_state["chroma_collection"])
-        summary = st.session_state["ingest_summary"]
-        st.success(f"Indexed {summary.get('exclusion', 0)} exclusion clauses, {summary.get('procedure', 0)} procedure sections, {summary.get('definition', 0)} definitions")
-    
-    st.markdown("---")
     st.markdown("## Sample Claims")
     st.caption("Click to load a sample claim into the input area.")
 
@@ -220,7 +213,36 @@ with st.sidebar:
 # Main area  --  claim input
 # ---------------------------------------------------------------------------
 
-input_tab1, input_tab2 = st.tabs(["📝 Manual Entry", "📄 Raw Text"])
+input_tab1, input_tab2, input_tab3, input_tab4 = st.tabs([
+    "📝 Manual Entry", 
+    "📄 Raw Text", 
+    "🧾 Upload Receipt",
+    "⚙️ Policy Setup"
+])
+
+with input_tab4:
+    st.markdown("### Policy Configuration")
+    st.info("Upload your insurance policy PDF here for exclusion checking. This tab is independent from receipt processing.")
+
+    policy_file = st.file_uploader("Upload policy document", type=["pdf"], key="policy_uploader")
+
+    if policy_file is not None:
+        if st.button("📥 Process Policy Document", type="primary"):
+            with st.spinner("Processing policy..."):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(policy_file.getvalue())
+                    tmp_path = tmp.name
+
+                try:
+                    collection, summary = ingest_policy_pdf(tmp_path)
+                    st.session_state["chroma_collection"] = collection
+                    st.session_state["ingest_summary"] = summary
+                    st.success(f"✅ Policy processed! {summary.get('exclusion', 0)} exclusions indexed.")
+                except Exception as e:
+                    st.error(f"Failed to process policy: {e}")
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
 
 with input_tab1:
     st.markdown("### Claim Details")
@@ -261,6 +283,96 @@ with input_tab2:
     )
     process_raw_btn = st.button("🚀 Process Raw Text Claim", type="primary", use_container_width=True)
 
+with input_tab3:
+    st.markdown("### Upload Claim Receipt")
+    receipt_file = st.file_uploader("Upload claim receipt (scanned or digital)", type=["pdf", "png", "jpg", "jpeg"])
+    
+    # Status indicator right after upload
+    if receipt_file is not None:
+        if st.session_state.get("receipt_filename") == receipt_file.name:
+            extracted = st.session_state.get("receipt_extracted", {})
+            if extracted and any(v for v in extracted.values() if v not in [None, "", "Unknown"]):
+                st.success("✅ Receipt processed successfully")
+            elif extracted == {}:
+                st.error("❌ Receipt processing failed")
+            else:
+                st.info("⏳ Receipt is being processed...")
+        else:
+            st.info("⏳ Receipt uploaded - extracting now...")
+
+    
+    process_receipt_btn = False
+    
+    if receipt_file is not None:
+        if "receipt_extracted" not in st.session_state or st.session_state.get("receipt_filename") != receipt_file.name:
+            with st.spinner("🔄 Extracting data from receipt... Please wait"):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf" if receipt_file.name.lower().endswith(".pdf") else ".png") as tmp:
+                    tmp.write(receipt_file.getvalue())
+                    tmp_path = tmp.name
+                
+                try:
+                    from receipt_vision import is_scanned_pdf, pdf_to_images, extract_receipt_via_vision
+                    try:
+                        from PIL import Image
+                    except ImportError:
+                        Image = None
+                        
+                    if receipt_file.name.lower().endswith(".pdf"):
+                        images = pdf_to_images(tmp_path)
+                        extracted = extract_receipt_via_vision(images)
+                    else:
+                        img = Image.open(tmp_path)
+                        extracted = extract_receipt_via_vision([img])
+                        
+                    st.session_state["receipt_extracted"] = extracted
+                    st.session_state["receipt_filename"] = receipt_file.name
+                    st.session_state["receipt_tmp_path"] = tmp_path
+                    
+                    # Success indicator
+                    if extracted and any(v for v in extracted.values() if v not in [None, "", "Unknown"]):
+                        st.success("✅ Receipt extraction successful! Review the fields below.")
+                    else:
+                        st.warning("⚠️ Extraction completed but some fields may be missing or unclear.")
+                except Exception as e:
+                    import traceback
+                    err = traceback.format_exc()
+                    st.error(f"Error extracting receipt: {e}")
+                    st.code(err, language="text")
+                    st.session_state["receipt_extracted"] = {}
+        
+        extracted = st.session_state.get("receipt_extracted", {})
+        
+        st.markdown("### Verify Extracted Data")
+        st.info("Review and correct the extracted fields below before processing.")
+        
+        # Parse date
+        try:
+            from datetime import date
+            extracted_date_str = extracted.get("treatment_date")
+            if extracted_date_str:
+                ext_date_val = date.fromisoformat(extracted_date_str)
+            else:
+                ext_date_val = date.today()
+        except:
+            ext_date_val = date.today()
+            
+        ext_claimant = st.text_input("Claimant Name (Extracted)", value=extracted.get("patient_name") or "")
+        ext_provider = st.text_input("Provider", value=extracted.get("provider_name") or "")
+        ext_date = st.date_input("Treatment Date", value=ext_date_val)
+        
+        try:
+            amt = float(extracted.get("amount_charged") or 0.0)
+        except:
+            amt = 0.0
+            
+        ext_amount = st.number_input("Amount Charged", min_value=0.0, step=10.0, value=amt)
+        ext_desc = st.text_area("Diagnosis/Description", value=extracted.get("diagnosis_or_treatment_description") or "")
+        
+        st.markdown("### Missing Form Fields")
+        ext_policy = st.text_input("Policy Number (Not on receipt)", value="POL-10234")
+        ext_benefit = st.selectbox("Benefit Type (Not on receipt)", ["Hospital & Surgical", "SMM", "Clinical", "Maternity", "Dental", "Network Dental"])
+        
+        process_receipt_btn = st.button("🚀 Process Receipt Claim", type="primary", use_container_width=True)
 
 # ---------------------------------------------------------------------------
 # Processing & output
@@ -297,6 +409,31 @@ if process_manual_btn:
 elif process_raw_btn and claim_text.strip():
     claim_to_process = claim_text.strip()
     
+elif process_receipt_btn:
+    deadline_exceeded = (date.today() - ext_date).days > 90
+    
+    claim_to_process = (
+        f"Claimant: {ext_claimant}. Policy: {ext_policy}. Provider: {ext_provider}. "
+        f"Benefit: {ext_benefit}. Date: {ext_date.isoformat()}. Amount: ${ext_amount}. "
+        f"Diagnosis: {ext_desc}"
+    )
+    
+    initial_data = {
+        "file_path": st.session_state.get("receipt_tmp_path"),
+        "treatment_date": ext_date.isoformat(),
+        "coverage_start_date": date(2025, 1, 1).isoformat(), # mock
+        "benefit_type": ext_benefit,
+        "submission_deadline_exceeded": deadline_exceeded,
+        "structured_claim": {
+            "claimant_name": ext_claimant,
+            "policy_number": ext_policy,
+            "claim_amount": ext_amount,
+            "description": ext_desc,
+            "incident_date": ext_date.isoformat(),
+            "claim_type": "health"
+        }
+    }
+
 if claim_to_process:
     if initial_data.get("submission_deadline_exceeded"):
         st.warning("⚠️ Submission deadline (90 days) has been exceeded.")
@@ -312,7 +449,7 @@ if claim_to_process:
         initial_state.update(initial_data)
 
     result = dict(initial_state)
-    progress_bar = st.progress(0, text="Starting agent pipeline...")
+    progress_bar = st.progress(0, text="🚀 Starting claim processing pipeline...")
     step_count = 0
     total_steps = 6
 
@@ -443,11 +580,14 @@ if claim_to_process:
             st.markdown(f'<span class="badge-denied">DENIED</span>',
                         unsafe_allow_html=True)
 
-        st.markdown(f"\n**Reason:** {result.get('decision_reason', 'N/A')}")
+        # Clear reason display
+        reason = result.get("decision_reason", "No reason provided")
+        st.markdown("### Why this decision?")
+        st.info(f"**{reason}**")
 
         route = result.get("route", "unknown")
         if route == "auto_approve":
-            st.info("Routed to: DecisionAgent (auto-approve path)")
+            st.success("Routed to: DecisionAgent (auto-approve path)")
         else:
             st.warning("Routed to: SeniorReviewAgent (escalation path)")
 
@@ -476,6 +616,234 @@ if claim_to_process:
             else:
                 icon = "🔹"
             st.text(f"{icon} {i:02d}. {entry}")
+
+    # ---- Download section (always visible after result) ----
+    st.markdown("---")
+    st.subheader("📥 Download Result")
+
+    claimant_safe = str(result.get("claimant_name", "unknown")).replace(" ", "_")
+    col_dl1, col_dl2 = st.columns(2)
+
+    with col_dl1:
+        # Generate comprehensive PDF report
+        try:
+            from reportlab.lib.pagesizes import letter
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.units import inch
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+            from reportlab.lib import colors
+            from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+            from io import BytesIO
+
+            buffer = BytesIO()
+            doc = SimpleDocTemplate(
+                buffer,
+                pagesize=letter,
+                rightMargin=0.75*inch,
+                leftMargin=0.75*inch,
+                topMargin=0.75*inch,
+                bottomMargin=0.75*inch
+            )
+
+            styles = getSampleStyleSheet()
+
+            # Custom styles
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontSize=18,
+                alignment=TA_CENTER,
+                spaceAfter=20,
+                textColor=colors.HexColor('#1a1a2e')
+            )
+            heading_style = ParagraphStyle(
+                'CustomHeading',
+                parent=styles['Heading2'],
+                fontSize=13,
+                spaceBefore=15,
+                spaceAfter=8,
+                textColor=colors.HexColor('#16213e')
+            )
+            normal_style = ParagraphStyle(
+                'CustomNormal',
+                parent=styles['Normal'],
+                fontSize=10,
+                leading=14,
+                alignment=TA_JUSTIFY
+            )
+            bold_style = ParagraphStyle(
+                'BoldNormal',
+                parent=styles['Normal'],
+                fontSize=10,
+                leading=14,
+                fontName='Helvetica-Bold'
+            )
+
+            story = []
+
+            # Title
+            story.append(Paragraph("Insurance Claim Evaluation Report", title_style))
+            story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", normal_style))
+            story.append(Spacer(1, 20))
+
+            # Claimant Information
+            story.append(Paragraph("1. Claimant Information", heading_style))
+            claimant_data = [
+                ["Claimant Name", str(result.get("claimant_name", "N/A"))],
+                ["Policy Number", str(result.get("policy_number", "N/A"))],
+                ["Benefit Type", str(result.get("benefit_type", result.get("claim_type", "N/A")))],
+                ["Treatment / Incident Date", str(result.get("treatment_date") or result.get("incident_date", "N/A"))],
+                ["Coverage Start Date", str(result.get("coverage_start_date", "N/A"))],
+                ["Claim Amount (HKD)", f"${result.get('claim_amount', 0):,.2f}"],
+                ["Description", str(result.get("description", "N/A"))[:500]],
+            ]
+            claimant_table = Table(claimant_data, colWidths=[2.2*inch, 4.5*inch])
+            claimant_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f0f4f8')),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#1a1a2e')),
+                ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cbd5e1')),
+                ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ]))
+            story.append(claimant_table)
+            story.append(Spacer(1, 15))
+
+            # Policy Validation
+            story.append(Paragraph("2. Policy Validation", heading_style))
+            policy_data = [
+                ["Policy Found", str(result.get("policy_found", "N/A"))],
+                ["Policy Status", str(result.get("policy_status", "N/A"))],
+                ["Coverage Valid", str(result.get("coverage_valid", "N/A"))],
+                ["Coverage Limit (HKD)", f"${result.get('coverage_limit', 0):,.2f}"],
+                ["Policy Notes", str(result.get("policy_notes", "N/A"))],
+            ]
+            policy_table = Table(policy_data, colWidths=[2.2*inch, 4.5*inch])
+            policy_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f0f4f8')),
+                ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cbd5e1')),
+                ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ]))
+            story.append(policy_table)
+            story.append(Spacer(1, 15))
+
+            # Exclusion Check
+            story.append(Paragraph("3. Exclusion Check", heading_style))
+            exc = result.get("exclusion_check", {})
+            exc_data = [
+                ["Excluded", str(exc.get("excluded", "N/A"))],
+                ["Method", str(exc.get("method", "N/A"))],
+                ["Reasoning", str(exc.get("reasoning", "N/A"))[:400]],
+            ]
+            if exc.get("matched_clause_text"):
+                exc_data.append(["Matched Clause", str(exc.get("matched_clause_text", ""))[:300]])
+            exc_table = Table(exc_data, colWidths=[2.2*inch, 4.5*inch])
+            exc_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f0f4f8')),
+                ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cbd5e1')),
+                ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ]))
+            story.append(exc_table)
+            story.append(Spacer(1, 15))
+
+            # Fraud Detection
+            story.append(Paragraph("4. Fraud Detection", heading_style))
+            fraud_data = [
+                ["Fraud Score", f"{result.get('fraud_score', 0)}/100"],
+                ["Red Flags", ", ".join(result.get("red_flags", [])) or "None"],
+                ["Reasoning", str(result.get("fraud_reasoning", "N/A"))[:500]],
+            ]
+            fraud_table = Table(fraud_data, colWidths=[2.2*inch, 4.5*inch])
+            fraud_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f0f4f8')),
+                ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cbd5e1')),
+                ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ]))
+            story.append(fraud_table)
+            story.append(Spacer(1, 15))
+
+            # Final Decision
+            story.append(Paragraph("5. Final Decision & Reasoning", heading_style))
+            decision_data = [
+                ["Decision Status", str(result.get("decision_status", "N/A")).upper()],
+                ["Route", str(result.get("route", "N/A"))],
+                ["Reason", str(result.get("decision_reason", "N/A"))],
+            ]
+            decision_table = Table(decision_data, colWidths=[2.2*inch, 4.5*inch])
+            decision_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f0f4f8')),
+                ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cbd5e1')),
+                ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ]))
+            story.append(decision_table)
+            story.append(Spacer(1, 15))
+
+            # Communication Letter
+            letter = result.get("communication_letter", "")
+            if letter:
+                story.append(Paragraph("6. Customer Communication Letter", heading_style))
+                # Escape special characters for reportlab
+                letter_clean = letter.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                story.append(Paragraph(letter_clean.replace("\n", "<br/>"), normal_style))
+
+            # Build PDF
+            doc.build(story)
+            pdf_bytes = buffer.getvalue()
+            buffer.close()
+
+            st.download_button(
+                label="⬇️ Download Full Report (PDF)",
+                data=pdf_bytes,
+                file_name=f"claim_report_{claimant_safe}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                help="Complete evaluation report with all policy, user and decision details"
+            )
+        except Exception as e:
+            st.error(f"PDF generation failed: {e}")
+            st.caption("Please ensure 'reportlab' is installed: pip install reportlab")
+
+    with col_dl2:
+        summary = (
+            "Insurance Claim Processing Result\n"
+            "=====================================\n"
+            f"Claimant: {result.get('claimant_name', 'N/A')}\n"
+            f"Policy Number: {result.get('policy_number', 'N/A')}\n"
+            f"Claim Amount: ${result.get('claim_amount', 0):,.2f}\n"
+            f"Decision: {result.get('decision_status', 'unknown').upper()}\n"
+            f"Fraud Score: {result.get('fraud_score', 0)}/100\n"
+            f"Reason: {result.get('decision_reason', 'N/A')}\n"
+            f"\nGenerated on: {datetime.now().isoformat()}\n"
+        )
+        st.download_button(
+            label="⬇️ Download Summary (TXT)",
+            data=summary,
+            file_name=f"claim_summary_{claimant_safe}.txt",
+            mime="text/plain",
+            use_container_width=True,
+            help="Human-readable one-page summary"
+        )
 
 elif process_raw_btn:
     st.warning("Please enter claim text before processing.")

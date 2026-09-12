@@ -75,6 +75,7 @@ MOCK_POLICIES: dict[str, dict[str, Any]] = {
 class ClaimState(TypedDict, total=False):
     # Raw input
     raw_text: str
+    file_path: str
 
     # IntakeAgent output
     claimant_name: str
@@ -162,7 +163,7 @@ def _fallback_intake(raw_text: str) -> dict[str, Any]:
 
     # Claimant name
     name_match = re.search(
-        r"[Cc]laimant\s*[:;-]\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)", text
+        r"[Cc]laimant\s*[:;-]\s*([A-Za-z]+(?:\s+[A-Za-z]+)*)", text
     )
     claimant_name = name_match.group(1).strip() if name_match else "Unknown"
 
@@ -192,7 +193,7 @@ def _fallback_intake(raw_text: str) -> dict[str, Any]:
 
     # Description: everything after common keywords, or last sentence
     desc_match = re.search(
-        r"(?:description|details|incident|happened|damage)[:;\s-]*(.+)",
+        r"(?:description|details|incident|happened|damage|diagnosis)[:;\s-]*(.+)",
         text,
         re.IGNORECASE | re.DOTALL,
     )
@@ -214,38 +215,76 @@ def _fallback_intake(raw_text: str) -> dict[str, Any]:
 
 
 def intake_agent(state: ClaimState) -> dict:
-    """Extract structured fields from raw claim text."""
-    raw = state["raw_text"]
+    """Extract structured fields from raw claim text or a scanned receipt PDF."""
+    raw = state.get("raw_text", "")
+    file_path = state.get("file_path")
     trace = list(state.get("trace", []))
-    trace.append(f"[IntakeAgent] Processing raw claim ({len(raw)} chars)")
-
-    system_prompt = (
-        "You are an insurance claim intake specialist. Extract the following fields "
-        "from the raw claim text and return ONLY a valid JSON object with these keys: "
-        "claimant_name, policy_number, claim_type (one of: auto, home, health), "
-        "incident_date, claim_amount (number), description. "
-        "Do NOT include any text outside the JSON."
-    )
-
+    
     result = None
-    llm_response = _llm_call(system_prompt, raw)
-    if llm_response:
+
+    if file_path:
         try:
-            # Strip markdown fences if present
-            cleaned = re.sub(r"```(?:json)?\s*", "", llm_response).strip().rstrip("`")
-            result = json.loads(cleaned)
-            trace.append("[IntakeAgent] LLM extraction successful")
-        except (json.JSONDecodeError, KeyError):
-            trace.append("[IntakeAgent] LLM response parse failed, using fallback")
-            result = None
+            from receipt_vision import is_scanned_pdf, pdf_to_images, extract_receipt_via_vision
+            if is_scanned_pdf(file_path):
+                trace.append(f"[IntakeAgent] Detected scanned PDF receipt: {file_path}")
+                images = pdf_to_images(file_path)
+                vision_result = extract_receipt_via_vision(images)
+                
+                # Map vision_result to standard structured_claim
+                result = {
+                    "claimant_name": vision_result.get("patient_name", "Unknown"),
+                    "policy_number": "UNKNOWN", # Still need manual entry for this
+                    "claim_type": "health",
+                    "incident_date": vision_result.get("treatment_date", "Unknown"),
+                    "claim_amount": vision_result.get("amount_charged", 0.0),
+                    "description": vision_result.get("diagnosis_or_treatment_description", "Medical Receipt"),
+                }
+                
+                method = vision_result.get("method", "vision")
+                trace.append(f"[IntakeAgent] Used {method} extraction from receipt")
+            else:
+                trace.append(f"[IntakeAgent] PDF is text-based. Ignoring vision pipeline.")
+        except Exception as e:
+            trace.append(f"[IntakeAgent] Vision pipeline error: {e}")
 
     if result is None:
-        result = _fallback_intake(raw)
-        trace.append("[IntakeAgent] Used rule-based fallback extraction")
+        trace.append(f"[IntakeAgent] Processing raw claim ({len(raw)} chars)")
+        system_prompt = (
+            "You are an insurance claim intake specialist. Extract the following fields "
+            "from the raw claim text and return ONLY a valid JSON object with these keys: "
+            "claimant_name, policy_number, claim_type (one of: auto, home, health), "
+            "incident_date, claim_amount (number), description. "
+            "Do NOT include any text outside the JSON."
+        )
+
+        llm_response = _llm_call(system_prompt, raw)
+        if llm_response:
+            try:
+                # Strip markdown fences if present
+                cleaned = re.sub(r"```(?:json)?\s*", "", llm_response).strip().rstrip("`")
+                result = json.loads(cleaned)
+                trace.append("[IntakeAgent] LLM extraction successful")
+            except (json.JSONDecodeError, KeyError):
+                trace.append("[IntakeAgent] LLM response parse failed, using fallback")
+                result = None
+
+        if result is None:
+            result = _fallback_intake(raw)
+            trace.append("[IntakeAgent] Used rule-based fallback extraction")
+
+    # Merge with manual form fields if provided in state (from structured_claim)
+    manual_fields = state.get("structured_claim", {})
+    if manual_fields:
+        for k, v in manual_fields.items():
+            if v and (result.get(k) in [None, "Unknown", "UNKNOWN", 0, 0.0, ""]):
+                result[k] = v
 
     # Normalise claim_amount to float
     try:
-        result["claim_amount"] = float(result["claim_amount"])
+        if result["claim_amount"] is None:
+            result["claim_amount"] = 0.0
+        else:
+            result["claim_amount"] = float(result["claim_amount"])
     except (ValueError, TypeError):
         result["claim_amount"] = 0.0
 

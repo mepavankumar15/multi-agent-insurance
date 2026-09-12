@@ -10,3 +10,8 @@ sentence-transformers
 pdfplumber
 scikit-learn
 python-dateutil
+
+PyMuPDF
+pillow
+pytesseract
+reportlab
