@@ -8,7 +8,9 @@ from datetime import date, timedelta
 from typing import Optional, Dict, List
 import random
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "data", "customers.db")
+from .paths import CUSTOMERS_DB
+
+DB_PATH = str(CUSTOMERS_DB)
 
 BENEFIT_TYPES = ["Hospital & Surgical", "Clinical", "Maternity", "Dental", "Network Dental"]
 

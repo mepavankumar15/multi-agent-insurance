@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from ingest import VectorCollection, _get_embedder
+from .ingest import VectorCollection, _get_embedder
 
 
 def retrieve_relevant_clauses(

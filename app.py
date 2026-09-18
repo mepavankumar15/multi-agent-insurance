@@ -1,7 +1,13 @@
 import os
+import sys
 import tempfile
 from datetime import date
 from pathlib import Path
+
+# Repo root on path so `pipeline` imports work on Streamlit Cloud and locally.
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 import streamlit as st
 
@@ -40,10 +46,11 @@ tab1, tab2, tab3 = st.tabs(["📝 Manual Entry", "📄 Raw Text", "🧾 Upload R
 
 @st.cache_resource
 def get_handbook(_version: int = 2):
-    from claims_agents import set_chroma_collection
-    from ingest import ingest_policy_pdf
+    from pipeline.claims_agents import set_chroma_collection
+    from pipeline.ingest import ingest_policy_pdf
+    from pipeline.paths import KNOWLEDGE_PDF
 
-    kb_path = Path(__file__).parent / "knowledge_base" / "policy_handbook.pdf"
+    kb_path = KNOWLEDGE_PDF
     if not kb_path.exists():
         return False
     collection, _ = ingest_policy_pdf(str(kb_path))
@@ -52,7 +59,7 @@ def get_handbook(_version: int = 2):
 
 
 def process_now(text, data):
-    from claims_agents import process_claim
+    from pipeline.claims_agents import process_claim
 
     try:
         get_handbook(2)
@@ -63,7 +70,7 @@ def process_now(text, data):
 
 def extract_receipt(file_bytes: bytes, filename: str) -> dict:
     from PIL import Image
-    from receipt_vision import extract_fields_from_text, extract_text_from_pdf
+    from pipeline.receipt_vision import extract_fields_from_text, extract_text_from_pdf
 
     is_pdf = filename.lower().endswith(".pdf")
     suffix = ".pdf" if is_pdf else ".png"
@@ -77,7 +84,7 @@ def extract_receipt(file_bytes: bytes, filename: str) -> dict:
             pdf_text = extract_text_from_pdf(tmp_path)
             return extract_fields_from_text(pdf_text)
         img = Image.open(tmp_path)
-        from receipt_vision import extract_receipt_via_vision
+        from pipeline.receipt_vision import extract_receipt_via_vision
 
         return extract_receipt_via_vision([img]) or {}
     finally:
@@ -333,7 +340,7 @@ if show_admin:
     st.markdown("---")
     st.subheader("Customers")
     try:
-        from customer_db import list_customers
+        from pipeline.customer_db import list_customers
 
         st.dataframe(list_customers(), use_container_width=True)
     except Exception as e:

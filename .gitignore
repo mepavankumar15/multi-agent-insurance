@@ -1,45 +1,28 @@
-# Environments
+# Secrets
 .env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Jupyter Notebook
-.ipynb_checkpoints
+.streamlit/secrets.toml
 
 # Python
+.venv/
+venv/
+ENV/
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
+.eggs/
+dist/
+build/
 
-# Streamlit secrets/config (keep local)
-.streamlit/secrets.toml
+# Notebooks
+.ipynb_checkpoints
 
-# Regenerated vector index
+# Runtime / local
 data/chroma_db/
-
-# Logs
 logs/
 *.log
+.DS_Store
+Thumbs.db
+
+# Old smoke dumps
+tests/smoke_*.txt

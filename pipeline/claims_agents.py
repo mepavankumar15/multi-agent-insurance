@@ -26,7 +26,7 @@ except ImportError:
 
 # Customer database (for verification gate)
 try:
-    from customer_db import get_customer_by_policy_number, get_customer_by_name
+    from .customer_db import get_customer_by_policy_number, get_customer_by_name
 except ImportError:
     get_customer_by_policy_number = None
     get_customer_by_name = None
@@ -35,7 +35,7 @@ from langgraph.graph import StateGraph, END
 from typing_extensions import TypedDict
 
 # Policy identity comes from customer_db. Policy wording / exclusions come from
-# knowledge_base/policy_handbook.pdf via ingest.py + exclusion_match_agent.
+# data/knowledge/policy_handbook.pdf via ingest.py + exclusion_match_agent.
 
 # ---------------------------------------------------------------------------
 # Shared state schema
@@ -196,7 +196,7 @@ def intake_agent(state: ClaimState) -> dict:
 
     if file_path:
         try:
-            from receipt_vision import is_scanned_pdf, pdf_to_images, extract_receipt_via_vision
+            from .receipt_vision import is_scanned_pdf, pdf_to_images, extract_receipt_via_vision
             if is_scanned_pdf(file_path):
                 trace.append(f"[IntakeAgent] Detected scanned PDF receipt: {file_path}")
                 images = pdf_to_images(file_path)
@@ -385,7 +385,7 @@ def policy_validation_agent(state: ClaimState) -> dict:
         f"Policy {customer.get('policy_number')}. "
         f"Benefit: {customer.get('benefit_type', 'N/A')}. "
         f"Remaining fund ${cov_limit:,.2f} of ${total_limit:,.2f}. "
-        f"Exclusion wording is loaded from knowledge_base/policy_handbook.pdf."
+        f"Exclusion wording is loaded from data/knowledge/policy_handbook.pdf."
     )
     if claim_amount and claim_amount > cov_limit:
         notes += f" Claim amount ${claim_amount:,.2f} exceeds remaining fund."
@@ -651,7 +651,7 @@ def exclusion_match_agent(state: ClaimState) -> dict:
             return {"exclusion_check": result, "trace": trace}
         
     try:
-        from retriever import retrieve_relevant_clauses
+        from .retriever import retrieve_relevant_clauses
         clauses = retrieve_relevant_clauses(_policy_collection, desc, section_type="exclusion", k=5)
         if not clauses:
             clauses = retrieve_relevant_clauses(_policy_collection, desc, section_type=None, k=5)
@@ -1002,7 +1002,7 @@ def process_claim(raw_text: str, initial_data: dict = None) -> ClaimState:
 
     # Step 6: Fund deduction on approval
     try:
-        from customer_db import deduct_fund_balance
+        from .customer_db import deduct_fund_balance
         verification = result.get("verification", {})
         decision_status = result.get("decision_status")
 

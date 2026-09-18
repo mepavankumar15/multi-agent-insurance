@@ -15,3 +15,5 @@ PyMuPDF
 pillow
 pytesseract
 reportlab
+faker
+rapidfuzz

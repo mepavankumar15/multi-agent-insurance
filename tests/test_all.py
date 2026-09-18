@@ -1,5 +1,9 @@
 """Test script for all 3 claim scenarios."""
-from claims_agents import process_claim, SAMPLE_CLAIMS
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from pipeline.claims_agents import process_claim, SAMPLE_CLAIMS
 
 for scenario, raw in SAMPLE_CLAIMS.items():
     print("=" * 60)

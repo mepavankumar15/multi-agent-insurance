@@ -10,14 +10,14 @@ warnings.filterwarnings("ignore")
 import logging
 logging.getLogger("pdfplumber").setLevel(logging.ERROR)
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datetime import date, timedelta
 
 
 def test_ingestion():
     print("\n[1] Ingestion test")
-    from ingest import ingest_policy_pdf
+    from pipeline.ingest import ingest_policy_pdf
 
     pdf_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "insurance_claims_pipeline_executed.pdf")
@@ -45,7 +45,7 @@ def test_cjk_exclusion(collection):
     if collection is None:
         print("  SKIP: No collection"); return
     import re
-    from retriever import retrieve_relevant_clauses
+    from pipeline.retriever import retrieve_relevant_clauses
     clauses = retrieve_relevant_clauses(collection, "insurance claim exclusion", k=5)
     print(f"  Retrieved {len(clauses)} clauses")
     cjk = any(re.search(r'[\u4e00-\u9fff\u3400-\u4dbf]', c["text"]) for c in clauses)
@@ -57,7 +57,7 @@ def test_exclusion_match(collection):
     if collection is None:
         print("  SKIP: No collection"); return
 
-    from claims_agents import process_claim, set_chroma_collection
+    from pipeline.claims_agents import process_claim, set_chroma_collection
     set_chroma_collection(collection)
 
     desc = "Patient admitted for pregnancy complications and delivery. Hospital & Surgical benefit."
@@ -91,7 +91,7 @@ def test_exclusion_match(collection):
 
 def test_90_day_deadline():
     print("\n[4] 90-day submission deadline")
-    from claims_agents import process_claim
+    from pipeline.claims_agents import process_claim
 
     past = (date.today() - timedelta(days=100)).isoformat()
     initial = {
@@ -122,7 +122,7 @@ def test_90_day_deadline():
 
 def test_fallback_no_api_key(collection):
     print("\n[5] Fallback test (no XAI_API_KEY)")
-    from claims_agents import process_claim, set_chroma_collection
+    from pipeline.claims_agents import process_claim, set_chroma_collection
     if collection:
         set_chroma_collection(collection)
 

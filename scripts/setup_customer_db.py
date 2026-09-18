@@ -11,9 +11,8 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from customer_db import init_db, generate_sample_customers
-
-DB_PATH = Path(__file__).parent.parent / "data" / "customers.db"
+from pipeline.customer_db import init_db, generate_sample_customers
+from pipeline.paths import CUSTOMERS_DB as DB_PATH
 
 
 def main():

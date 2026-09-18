@@ -14,7 +14,10 @@ import json
 import re
 from difflib import SequenceMatcher
 from PIL import Image
-from receipt_vision import pdf_to_images, extract_generic_receipt  # uses the generic helper
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from pipeline.receipt_vision import pdf_to_images, extract_generic_receipt
 
 RECEIPTS_DIR = "test_data/sample_receipts"
 

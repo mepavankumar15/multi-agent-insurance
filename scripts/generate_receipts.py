@@ -12,9 +12,14 @@ from reportlab.pdfgen import canvas
 from reportlab.lib import colors
 from faker import Faker
 from typing import Dict
-import customer_db
+from pathlib import Path
+import sys
 
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "data", "test_data", "generated_receipts")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from pipeline import customer_db
+from pipeline.paths import RECEIPTS_DIR
+
+OUTPUT_DIR = str(RECEIPTS_DIR)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 fake = Faker()

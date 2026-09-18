@@ -6,9 +6,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pdfplumber
-from customer_db import list_customers, get_customer_by_policy_number
-
-RECEIPT_DIR = Path(__file__).parent.parent / "data" / "test_data" / "generated_receipts"
+from pipeline.customer_db import list_customers, get_customer_by_policy_number
+from pipeline.paths import RECEIPTS_DIR as RECEIPT_DIR
 
 
 def parse_pdf(path: Path) -> dict:

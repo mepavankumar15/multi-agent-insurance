@@ -1,48 +1,86 @@
-# Multi-Agent Insurance Claims Processing System
+# Multi-Agent Insurance Claims Processor
 
-A LangGraph pipeline of 6 specialized AI agents that process insurance claims through intake, policy validation, fraud detection, routing, decision-making, and customer communication.
+Streamlit app for medical claim intake, member verification, handbook exclusion checks, and a written decision.
 
-Powered by **LangGraph** and **Grok (xAI)**, with deterministic rule-based fallbacks for fully offline operation.
+**Deploy:** Streamlit Community Cloud → this repo, file **`app.py`** (still at the project root).  
+**Run locally:** `python run_app.py` → http://localhost:8501
 
-## Architecture
+---
 
-```mermaid
-graph TD
-    START --> IntakeAgent
-    IntakeAgent --> PolicyValidationAgent
-    PolicyValidationAgent --> FraudDetectionAgent
-    FraudDetectionAgent --> Router{Risk Router}
-    
-    Router -- Low Risk --> DecisionAgent
-    Router -- Escalated --> SeniorReviewAgent
-    
-    DecisionAgent --> CommunicationAgent
-    SeniorReviewAgent --> CommunicationAgent
-    CommunicationAgent --> END
+## What it does
+
+1. Read a claim from a form, pasted text, or a receipt (PDF / image).
+2. Look up the member in SQLite (`data/customers.db`).
+3. Check remaining fund balance.
+4. Match the claim against **General exclusions** in `data/knowledge/policy_handbook.pdf`.
+5. Return **approved**, **denied** (exclusion), **rejected** (unknown member / over fund), or **escalated**.
+
+Grok (`XAI_API_KEY`) is optional. Without it, rule-based fallbacks still run.
+
+---
+
+## Layout
+
+Kept simple for GitHub and for Streamlit Cloud (entry file unchanged):
+
+```text
+app.py                 ← Streamlit entry (Cloud + local)
+run_app.py             ← local launcher
+requirements.txt
+.streamlit/config.toml
+
+pipeline/              Python package (agents, ingest, RAG, vision, customers)
+data/
+  customers.db
+  knowledge/policy_handbook.pdf
+  receipts/            sample PDFs
+scripts/               setup DB, generate receipts, compare receipts to DB
+tests/
+docs/notebooks/        optional notebooks
 ```
 
-## Features
+Nothing else is required at the root besides `app.py` and `requirements.txt`.
 
-- **Multi-Agent Pipeline**: 6 distinct agents sharing a typed state.
-- **LLM-Powered Data Extraction**: Converts unstructured claims text into structured JSON.
-- **Customer database + policy handbook**: Identity and fund limits come from `customer_db`; exclusions come from `knowledge_base/policy_handbook.pdf`.
-- **Smart Fraud Detection**: Analyzes urgency language, mismatched dates, and limits.
-- **Interactive UI**: A sleek Streamlit application to visualize the agent processing trace and output.
+---
 
-## Setup for Streamlit Deployment
+## Local setup
 
-1. Clone the repository
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Set your API Key in Streamlit Community Cloud:
-   - Go to App Settings -> Secrets
-   - Add `XAI_API_KEY="your_api_key_here"`
-   
-4. Run locally:
-   ```bash
-   streamlit run app.py
-   ```
+```bash
+python -m pip install -r requirements.txt
+python run_app.py
+```
 
-*(Note: The `.env` file is intentionally excluded from Git via `.gitignore` to keep your API keys secure. Ensure you add it as a secret in your hosting environment!)*
+If you need a fresh sample database:
+
+```bash
+python scripts/setup_customer_db.py
+```
+
+Optional `.env` (not committed):
+
+```text
+XAI_API_KEY=...
+```
+
+On Streamlit Cloud, set the same key under **App settings → Secrets**.
+
+---
+
+## Sample receipts (`data/receipts/`)
+
+| Pattern | Typical outcome |
+|---------|-----------------|
+| `CUST-*_clean.pdf` | Verify, usually approve |
+| `CUST-*_over_limit.pdf` | Reject at verification (insufficient fund) |
+| `CUST-*_exclusion_match.pdf` | Deny (handbook exclusion, e.g. cosmetic / checkup) |
+| `UNK_*_unknown_customer.pdf` | Reject at verification (not in DB) |
+
+---
+
+## Scripts
+
+```bash
+python scripts/setup_customer_db.py
+python scripts/generate_receipts.py
+python scripts/check_receipts_vs_db.py
+```

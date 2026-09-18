@@ -16,11 +16,11 @@ warnings.filterwarnings("ignore")
 import logging
 logging.getLogger("pdfplumber").setLevel(logging.ERROR)
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datetime import date, timedelta
-from ingest import ingest_policy_pdf
-from claims_agents import process_claim, set_chroma_collection
+from pipeline.ingest import ingest_policy_pdf
+from pipeline.claims_agents import process_claim, set_chroma_collection
 
 
 def test_ingestion():
@@ -62,7 +62,7 @@ def test_chinese_exclusion(collection):
         print("SKIP: No collection.")
         return
 
-    from retriever import retrieve_relevant_clauses
+    from pipeline.retriever import retrieve_relevant_clauses
     import re
 
     clauses = retrieve_relevant_clauses(collection, "health insurance claim", k=5)
