@@ -9,10 +9,11 @@ lightweight pure-Python in-memory vector store (no ChromaDB native/Rust dependen
 
 from __future__ import annotations
 
+import os
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Any
 
 import numpy as np
 
@@ -138,7 +139,7 @@ def _get_embedder():
 # PDF ingestion
 # ---------------------------------------------------------------------------
 
-def ingest_policy_pdf(file_path: str) -> Tuple[VectorCollection, dict]:
+def ingest_policy_pdf(pdf_path: str) -> tuple[VectorCollection, dict]:
     """
     Extract text from a bilingual (English + Chinese) policy PDF, keep only
     the English section, chunk by structural markers, embed, and return an
@@ -155,7 +156,7 @@ def ingest_policy_pdf(file_path: str) -> Tuple[VectorCollection, dict]:
     # ------------------------------------------------------------------
     english_pages: List[dict] = []
 
-    with pdfplumber.open(file_path) as pdf:
+    with pdfplumber.open(pdf_path) as pdf:
         for i, page in enumerate(pdf.pages):
             text = page.extract_text() or ""
             if not text.strip():
@@ -209,18 +210,23 @@ def ingest_policy_pdf(file_path: str) -> Tuple[VectorCollection, dict]:
 
         lower = stripped.lower()
 
-        # Detect section boundary headers
+        # Detect section boundary headers (Bupa uses "General exclusions", not ALL CAPS)
         is_header = (
             len(stripped) < 120 and
             (stripped.isupper() or
-             (stripped.istitle() and not stripped.endswith(".")))
+             (stripped.istitle() and not stripped.endswith(".")) or
+             lower in {"general exclusions", "glossary of terms"} or
+             lower.startswith("general exclusion"))
         )
+
+        if "shall not cover" in lower or lower == "general exclusions":
+            in_exclusions, in_glossary = True, False
 
         if is_header:
             if "exclusion" in lower:
                 _flush()
                 in_exclusions, in_glossary = True, False
-                current_type = "procedure"  # section header itself is procedure
+                current_type = "procedure"
                 current_page = _page_of(char_pos)
                 current_lines.append(stripped)
                 continue
@@ -240,7 +246,7 @@ def ingest_policy_pdf(file_path: str) -> Tuple[VectorCollection, dict]:
                 continue
 
         # Exclusion: numbered list items → each is its own chunk
-        if in_exclusions and re.match(r"^\d+\.\s", stripped):
+        if in_exclusions and re.match(r"^\d+\.\s*", stripped):
             _flush()
             current_type = "exclusion"
             current_page = _page_of(char_pos)
@@ -269,15 +275,13 @@ def ingest_policy_pdf(file_path: str) -> Tuple[VectorCollection, dict]:
     texts = [c["text"] for c in chunks]
 
     if not texts:
-        # Return empty collection
         collection = VectorCollection(name="policy_clauses")
         return collection, {"exclusion": 0, "definition": 0, "procedure": 0, "total": 0}
 
-    # Refit TF-IDF on the full corpus for a stable vocabulary
     if isinstance(embedder, TfidfEmbedder):
         embedder.refit(texts)
 
-    embeddings = embedder.encode(texts)  # np.ndarray shape (N, D)
+    embeddings = embedder.encode(texts)
 
     # ------------------------------------------------------------------
     # 5. Store in the in-memory VectorCollection
@@ -303,99 +307,4 @@ def ingest_policy_pdf(file_path: str) -> Tuple[VectorCollection, dict]:
     return collection, summary
 
 
-def extract_policy_metadata(pdf_path: str) -> dict:
-    """
-    Lightweight metadata extractor for uploaded policy PDFs.
-    Uses pdfplumber + regex fallback. Safe, non-breaking addition.
-    Returns a dict with: policy_number, holder, status, coverage_type,
-    coverage_limit, deductible (or None if not found).
-    """
-    try:
-        import pdfplumber
-        import re
 
-        text = ""
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages[:4]:  # first 4 pages usually have the summary
-                page_text = page.extract_text() or ""
-                text += page_text + "\n"
-
-        text_lower = text.lower()
-
-        result = {
-            "policy_number": None,
-            "holder": None,
-            "status": "active",
-            "coverage_type": None,
-            "coverage_limit": None,
-            "deductible": None,
-            "raw_text_sample": text[:800],
-        }
-
-        # Policy number patterns
-        pol_patterns = [
-            r"(?:policy|certificate|contract)\s*(?:no\.?|number|#)?\s*[:\-]?\s*([A-Z]{2,4}[\-\s]?\d{4,6})",
-            r"(POL\-\d{4,6})",
-        ]
-        for pat in pol_patterns:
-            m = re.search(pat, text, re.IGNORECASE)
-            if m:
-                result["policy_number"] = m.group(1).upper().replace(" ", "")
-                break
-
-        # Holder name (common patterns)
-        holder_patterns = [
-            r"(?:insured|policyholder|holder|name)\s*[:\-]\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,3})",
-            r"([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,3})\s*(?:\(the insured|\(policyholder)",
-        ]
-        for pat in holder_patterns:
-            m = re.search(pat, text)
-            if m:
-                result["holder"] = m.group(1).strip()
-                break
-
-        # Coverage type
-        if any(k in text_lower for k in ["auto", "motor", "vehicle", "car"]):
-            result["coverage_type"] = "auto"
-        elif any(k in text_lower for k in ["home", "property", "household", "building"]):
-            result["coverage_type"] = "home"
-        elif any(k in text_lower for k in ["health", "medical", "hospital", "surgical", "clinical"]):
-            result["coverage_type"] = "health"
-
-        # Coverage limit
-        limit_match = re.search(r"(?:limit|sum insured|coverage limit)[^\d]{0,20}(\$?\s*[\d,]+(?:\.\d{2})?)", text, re.IGNORECASE)
-        if limit_match:
-            try:
-                val = float(limit_match.group(1).replace("$", "").replace(",", "").strip())
-                result["coverage_limit"] = val
-            except:
-                pass
-
-        # Deductible
-        ded_match = re.search(r"(?:deductible|excess)[^\d]{0,20}(\$?\s*[\d,]+(?:\.\d{2})?)", text, re.IGNORECASE)
-        if ded_match:
-            try:
-                val = float(ded_match.group(1).replace("$", "").replace(",", "").strip())
-                result["deductible"] = val
-            except:
-                pass
-
-        # Status
-        if "lapsed" in text_lower or "expired" in text_lower or "cancelled" in text_lower:
-            result["status"] = "lapsed"
-        elif "suspended" in text_lower:
-            result["status"] = "suspended"
-
-        return result
-
-    except Exception as e:
-        print(f"[extract_policy_metadata] Error: {e}")
-        return {
-            "policy_number": None,
-            "holder": None,
-            "status": "active",
-            "coverage_type": None,
-            "coverage_limit": None,
-            "deductible": None,
-            "error": str(e),
-        }

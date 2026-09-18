@@ -34,5 +34,12 @@ wheels/
 .installed.cfg
 *.egg
 
-# Streamlit
-.streamlit/
+# Streamlit secrets/config (keep local)
+.streamlit/secrets.toml
+
+# Regenerated vector index
+data/chroma_db/
+
+# Logs
+logs/
+*.log

@@ -24,49 +24,18 @@ try:
 except ImportError:
     pass
 
+# Customer database (for verification gate)
+try:
+    from customer_db import get_customer_by_policy_number, get_customer_by_name
+except ImportError:
+    get_customer_by_policy_number = None
+    get_customer_by_name = None
+
 from langgraph.graph import StateGraph, END
 from typing_extensions import TypedDict
 
-# ---------------------------------------------------------------------------
-# Mock policy database
-# ---------------------------------------------------------------------------
-MOCK_POLICIES: dict[str, dict[str, Any]] = {
-    "POL-10234": {
-        "holder": "Jane Doe",
-        "status": "active",
-        "coverage_type": "auto",
-        "coverage_limit": 10000,
-        "deductible": 500,
-    },
-    "POL-20456": {
-        "holder": "John Smith",
-        "status": "active",
-        "coverage_type": "home",
-        "coverage_limit": 50000,
-        "deductible": 1000,
-    },
-    "POL-30789": {
-        "holder": "Alice Johnson",
-        "status": "lapsed",
-        "coverage_type": "auto",
-        "coverage_limit": 15000,
-        "deductible": 750,
-    },
-    "POL-40100": {
-        "holder": "Bob Williams",
-        "status": "active",
-        "coverage_type": "health",
-        "coverage_limit": 25000,
-        "deductible": 200,
-    },
-    "POL-50321": {
-        "holder": "Clara Davis",
-        "status": "active",
-        "coverage_type": "auto",
-        "coverage_limit": 5000,
-        "deductible": 300,
-    },
-}
+# Policy identity comes from customer_db. Policy wording / exclusions come from
+# knowledge_base/policy_handbook.pdf via ingest.py + exclusion_match_agent.
 
 # ---------------------------------------------------------------------------
 # Shared state schema
@@ -117,6 +86,9 @@ class ClaimState(TypedDict, total=False):
     benefit_type: str
     submission_deadline_exceeded: bool
     structured_claim: dict
+
+    # Verification gate output
+    verification: dict   # {"passed": bool, "reason": str, "customer_id": str, ...}
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +252,16 @@ def intake_agent(state: ClaimState) -> dict:
             if v:
                 result[k] = v
 
+    # Verified customer identity wins over OCR/heading noise (e.g. "Details")
+    verified = (state.get("verification") or {}).get("matched_customer") or {}
+    if verified.get("name"):
+        result["claimant_name"] = verified["name"]
+    if verified.get("policy_number"):
+        result["policy_number"] = verified["policy_number"]
+    if verified.get("benefit_type"):
+        result["benefit_type"] = verified["benefit_type"]
+        result["claim_type"] = "health"
+
     # Normalise claim_amount to float
     try:
         if result["claim_amount"] is None:
@@ -297,6 +279,71 @@ def intake_agent(state: ClaimState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# NEW: Verification Gate (runs before Intake)
+# ---------------------------------------------------------------------------
+
+def verification_agent(state: ClaimState) -> ClaimState:
+    """
+    Checks if the customer exists and has enough remaining fund balance.
+    This runs BEFORE any agent processing.
+    """
+    trace = list(state.get("trace", []))
+    trace.append("[VerificationAgent] Running pre-check...")
+
+    extracted = state.get("structured_claim", {})
+    patient_name = extracted.get("claimant_name") or state.get("claimant_name")
+    policy_number = extracted.get("policy_number") or state.get("policy_number")
+    amount = extracted.get("claim_amount") or state.get("claim_amount") or 0.0
+
+    if not get_customer_by_policy_number or not get_customer_by_name:
+        trace.append("[VerificationAgent] Customer DB not available. Skipping check.")
+        return {"verification": {"passed": True}, "trace": trace}
+
+    customer = None
+    if policy_number:
+        customer = get_customer_by_policy_number(policy_number)
+
+    if not customer and patient_name:
+        customer = get_customer_by_name(patient_name)
+
+    if not customer:
+        reason = "Customer not found in records"
+        trace.append(f"[VerificationAgent] FAIL: {reason}")
+        return {
+            "verification": {
+                "passed": False,
+                "reason": "customer_not_found",
+                "detail": reason
+            },
+            "trace": trace
+        }
+
+    if amount > customer["remaining_fund_balance"]:
+        reason = f"Claim amount ${amount:,.2f} exceeds remaining balance ${customer['remaining_fund_balance']:,.2f}"
+        trace.append(f"[VerificationAgent] FAIL: {reason}")
+        return {
+            "verification": {
+                "passed": False,
+                "reason": "insufficient_fund_balance",
+                "detail": reason
+            },
+            "trace": trace
+        }
+
+    trace.append(f"[VerificationAgent] PASS for {customer['customer_id']}")
+    return {
+        "verification": {
+            "passed": True,
+            "customer_id": customer["customer_id"],
+            "matched_customer": customer
+        },
+        "claimant_name": customer.get("name"),
+        "policy_number": customer.get("policy_number"),
+        "trace": trace
+    }
+
+
+# ---------------------------------------------------------------------------
 # 2. PolicyValidationAgent
 # ---------------------------------------------------------------------------
 
@@ -308,84 +355,47 @@ def set_chroma_collection(collection):
     _policy_collection = collection
 
 def policy_validation_agent(state: ClaimState) -> dict:
-    """Validate claim against mock policy database (with hybrid PDF upload support)."""
+    """Validate identity/limits via customer_db. Policy wording is in policy_handbook.pdf."""
     trace = list(state.get("trace", []))
     policy_number = state.get("policy_number", "UNKNOWN")
-    claim_type = state.get("claim_type", "")
     claim_amount = state.get("claim_amount", 0.0)
 
-    trace.append(f"[PolicyValidationAgent] Looking up policy {policy_number}")
+    trace.append(f"[PolicyValidationAgent] Looking up policy {policy_number} in customer_db")
 
-    # NEW: Hybrid lookup — prefer uploaded policy PDF metadata if available
-    uploaded = state.get("uploaded_policy")
-    if uploaded and uploaded.get("policy_number") == policy_number:
-        trace.append("[PolicyValidationAgent] Using policy metadata from uploaded PDF")
-        status = uploaded.get("status", "active")
-        cov_type = uploaded.get("coverage_type") or claim_type
-        cov_limit = uploaded.get("coverage_limit") or 999999.0
-        coverage_valid = (status == "active") and (cov_type == claim_type)
+    verified = (state.get("verification") or {}).get("matched_customer") or {}
+    customer = verified if verified.get("policy_number") else None
+    if not customer and get_customer_by_policy_number:
+        customer = get_customer_by_policy_number(policy_number)
 
-        notes_parts = []
-        if status != "active":
-            notes_parts.append(f"Policy is {status} (not active).")
-        if cov_type != claim_type:
-            notes_parts.append(f"Coverage type mismatch: policy='{cov_type}' vs claim='{claim_type}'.")
-        if claim_amount > cov_limit:
-            notes_parts.append(f"Claim amount ${claim_amount:,.2f} exceeds limit ${cov_limit:,.2f}.")
-        if not notes_parts:
-            notes_parts.append("Policy validated from uploaded document.")
-
-        return {
-            "policy_found": True,
-            "policy_status": status,
-            "coverage_valid": coverage_valid,
-            "coverage_limit": float(cov_limit),
-            "policy_notes": " ".join(notes_parts),
-            "trace": trace,
-        }
-
-    # Fallback: original mock database logic (unchanged)
-    policy = MOCK_POLICIES.get(policy_number)
-
-    if policy is None:
-        trace.append(f"[PolicyValidationAgent] Policy {policy_number} NOT FOUND")
+    if not customer:
+        trace.append(f"[PolicyValidationAgent] Policy {policy_number} NOT FOUND in customer_db")
         return {
             "policy_found": False,
             "policy_status": "not_found",
             "coverage_valid": False,
             "coverage_limit": 0.0,
-            "policy_notes": f"Policy {policy_number} does not exist in our records.",
+            "policy_notes": f"Policy {policy_number} does not exist in customer records.",
             "trace": trace,
         }
 
-    status = policy["status"]
-    cov_type = policy["coverage_type"]
-    cov_limit = policy["coverage_limit"]
-    coverage_valid = (status == "active") and (cov_type == claim_type)
+    cov_limit = float(customer.get("remaining_fund_balance") or customer.get("total_fund_limit") or 0)
+    total_limit = float(customer.get("total_fund_limit") or cov_limit)
+    notes = (
+        f"Customer {customer.get('customer_id')} / {customer.get('name')}. "
+        f"Policy {customer.get('policy_number')}. "
+        f"Benefit: {customer.get('benefit_type', 'N/A')}. "
+        f"Remaining fund ${cov_limit:,.2f} of ${total_limit:,.2f}. "
+        f"Exclusion wording is loaded from knowledge_base/policy_handbook.pdf."
+    )
+    if claim_amount and claim_amount > cov_limit:
+        notes += f" Claim amount ${claim_amount:,.2f} exceeds remaining fund."
 
-    notes_parts = []
-    if status != "active":
-        notes_parts.append(f"Policy is {status} (not active).")
-    if cov_type != claim_type:
-        notes_parts.append(
-            f"Coverage type mismatch: policy covers '{cov_type}' but claim is '{claim_type}'."
-        )
-    if claim_amount > cov_limit:
-        notes_parts.append(
-            f"Claim amount ${claim_amount:,.2f} exceeds coverage limit ${cov_limit:,.2f}."
-        )
-    if not notes_parts:
-        notes_parts.append("Policy is valid and covers this claim type.")
-
-    notes = " ".join(notes_parts)
-    trace.append(f"[PolicyValidationAgent] status={status}, coverage_valid={coverage_valid}, "
-                 f"limit=${cov_limit:,.2f}")
-
+    trace.append(f"[PolicyValidationAgent] validated {customer.get('customer_id')} via customer_db")
     return {
         "policy_found": True,
-        "policy_status": status,
-        "coverage_valid": coverage_valid,
-        "coverage_limit": float(cov_limit),
+        "policy_status": "active",
+        "coverage_valid": True,
+        "coverage_limit": cov_limit,
         "policy_notes": notes,
         "trace": trace,
     }
@@ -526,8 +536,7 @@ def fraud_detection_agent(state: ClaimState) -> dict:
 # ---------------------------------------------------------------------------
 
 def route_claim(state: ClaimState) -> str:
-    """Route to DecisionAgent or SeniorReviewAgent based on risk factors."""
-    fraud_score = state.get("fraud_score", 0)
+    """Route to DecisionAgent or SeniorReviewAgent. Fraud scoring is not used."""
     coverage_valid = state.get("coverage_valid", True)
     claim_amount = state.get("claim_amount", 0)
     coverage_limit = state.get("coverage_limit", float("inf"))
@@ -535,8 +544,6 @@ def route_claim(state: ClaimState) -> str:
     excluded = state.get("exclusion_check", {}).get("excluded", False)
     deadline_exceeded = state.get("submission_deadline_exceeded", False)
 
-    if fraud_score >= 60:
-        return "senior_review"
     if not policy_found or not coverage_valid:
         return "senior_review"
     if claim_amount > coverage_limit:
@@ -615,13 +622,51 @@ def exclusion_match_agent(state: ClaimState) -> dict:
     desc = state.get("description", "")
     if not desc:
         desc = state.get("structured_claim", {}).get("description", "")
+
+    # Deterministic handbook keywords (does not depend on chunk tagging)
+    desc_l = (desc or "").lower()
+    keyword_hits = [
+        (("cosmetic", "dermatology consultation", "body weight", "hair mineral"),
+         5, "Cosmetic / body-weight treatment is excluded (General exclusions item 5)."),
+        (("checkup", "check-up", "check up", "general check", "vaccination", "inoculation", "routine blood"),
+         6, "Preventive care / routine check-up is excluded (General exclusions item 6)."),
+        (("pregnancy", "childbirth", "abortion", "miscarriage", "in-vitro", "infertility"),
+         10, "Pregnancy-related treatment is excluded unless Maternity Benefit applies (item 10)."),
+    ]
+    benefit = (state.get("benefit_type") or "").lower()
+    verified = (state.get("verification") or {}).get("matched_customer") or {}
+    benefit = benefit or (verified.get("benefit_type") or "").lower()
+    for words, clause_no, reason in keyword_hits:
+        if any(w in desc_l for w in words):
+            if clause_no == 10 and "maternity" in benefit:
+                continue
+            result = {
+                "excluded": True,
+                "matched_clause_number": clause_no,
+                "matched_clause_text": reason,
+                "reasoning": reason,
+                "method": "handbook_keyword",
+            }
+            trace.append(f"[ExclusionMatchAgent] Keyword exclusion clause {clause_no}")
+            return {"exclusion_check": result, "trace": trace}
         
     try:
         from retriever import retrieve_relevant_clauses
         clauses = retrieve_relevant_clauses(_policy_collection, desc, section_type="exclusion", k=5)
+        if not clauses:
+            clauses = retrieve_relevant_clauses(_policy_collection, desc, section_type=None, k=5)
     except Exception as e:
         trace.append(f"[ExclusionMatchAgent] Retrieval failed: {e}")
-        return {"trace": trace}
+        return {
+            "exclusion_check": {
+                "excluded": False,
+                "matched_clause_number": None,
+                "matched_clause_text": None,
+                "reasoning": f"Retrieval failed: {e}",
+                "method": "error",
+            },
+            "trace": trace,
+        }
         
     if not clauses:
         trace.append("[ExclusionMatchAgent] No exclusions retrieved")
@@ -675,12 +720,16 @@ def exclusion_match_agent(state: ClaimState) -> dict:
     }
 
 def route_after_exclusion(state: ClaimState) -> str:
-    """Route based on exclusion result."""
+    """Route based on exclusion / policy / deadline. No fraud score."""
     if state.get("exclusion_check", {}).get("excluded", False):
         return "senior_review"
     if state.get("submission_deadline_exceeded", False):
         return "senior_review"
-    return "fraud_detection"
+    if not state.get("policy_found", True) or not state.get("coverage_valid", True):
+        return "senior_review"
+    if state.get("claim_amount", 0) > state.get("coverage_limit", float("inf")):
+        return "senior_review"
+    return "decision"
 
 # ---------------------------------------------------------------------------
 # 6. DecisionAgent
@@ -694,9 +743,9 @@ def decision_agent(state: ClaimState) -> dict:
     reason = (
         f"Claim approved. Policy {state.get('policy_number')} is "
         f"{state.get('policy_status', 'active')} with valid coverage. "
-        f"Fraud score is low ({state.get('fraud_score', 0)}/100). "
         f"Claim amount ${state.get('claim_amount', 0):,.2f} is within the "
-        f"coverage limit of ${state.get('coverage_limit', 0):,.2f}."
+        f"remaining fund of ${state.get('coverage_limit', 0):,.2f}. "
+        f"No handbook exclusion matched."
     )
 
     trace.append(f"[DecisionAgent] Decision: approved  --  {reason}")
@@ -719,34 +768,32 @@ def senior_review_agent(state: ClaimState) -> dict:
     trace.append("[SeniorReviewAgent] Reviewing escalated claim")
 
     triggers: list[str] = []
-    if state.get("fraud_score", 0) >= 60:
-        triggers.append(f"High fraud score ({state.get('fraud_score')}/100)")
     if not state.get("policy_found", True):
-        triggers.append("Policy not found in records")
+        triggers.append("Policy not found in customer records")
     if not state.get("coverage_valid", True):
         triggers.append(f"Invalid coverage (policy status: {state.get('policy_status')})")
     if state.get("claim_amount", 0) > state.get("coverage_limit", float("inf")):
         triggers.append(
             f"Claim amount ${state.get('claim_amount', 0):,.2f} exceeds "
-            f"coverage limit ${state.get('coverage_limit', 0):,.2f}"
+            f"remaining fund ${state.get('coverage_limit', 0):,.2f}"
         )
     if state.get("exclusion_check", {}).get("excluded"):
         triggers.append(f"Policy exclusion applies: Clause {state['exclusion_check'].get('matched_clause_number')}")
     if state.get("submission_deadline_exceeded", False):
         triggers.append("Submission deadline (90 days) exceeded")
     if not triggers:
-        triggers.append("Escalated for manual review")
+        triggers.append("Manual review required")
 
+    status = "denied" if state.get("exclusion_check", {}).get("excluded") else "escalated"
     reason = (
-        f"Claim escalated for senior review. Trigger(s): {'; '.join(triggers)}. "
-        f"Policy: {state.get('policy_number')}, Fraud score: {state.get('fraud_score', 0)}/100."
+        f"Claim {status}. Trigger(s): {'; '.join(triggers)}. "
+        f"Policy: {state.get('policy_number')}."
     )
 
-    trace.append(f"[SeniorReviewAgent] Decision: escalated  --  triggers: {triggers}")
-
+    trace.append(f"[SeniorReviewAgent] Decision: {status}  --  triggers: {triggers}")
     return {
-        "route": "escalate",
-        "decision_status": "escalated",
+        "route": "escalate" if status == "escalated" else "denied",
+        "decision_status": status,
         "decision_reason": reason,
         "trace": trace,
     }
@@ -872,16 +919,38 @@ def build_graph() -> StateGraph:
     graph = StateGraph(ClaimState)
 
     # Add nodes
+    graph.add_node("verification", verification_agent)
     graph.add_node("intake", intake_agent)
     graph.add_node("policy_validation", policy_validation_agent)
     graph.add_node("exclusion_check", exclusion_match_agent)
-    graph.add_node("fraud_detection", fraud_detection_agent)
     graph.add_node("decision", decision_agent)
     graph.add_node("senior_review", senior_review_agent)
     graph.add_node("communication", communication_agent)
+    graph.add_node("verification_rejected", lambda state: {
+        "decision_status": "rejected",
+        "decision_reason": state.get("verification", {}).get("detail", "Verification failed"),
+        "trace": state.get("trace", []) + ["[System] Claim rejected at verification gate"]
+    })
 
-    # Linear edges
-    graph.set_entry_point("intake")
+    # Entry point is now Verification
+    graph.set_entry_point("verification")
+
+    # Conditional routing after verification
+    def route_after_verification(state):
+        if state.get("verification", {}).get("passed") is False:
+            return "verification_rejected"
+        return "intake"
+
+    graph.add_conditional_edges(
+        "verification",
+        route_after_verification,
+        {
+            "verification_rejected": "verification_rejected",
+            "intake": "intake",
+        },
+    )
+
+    # Linear edges for the main pipeline
     graph.add_edge("intake", "policy_validation")
     graph.add_edge("policy_validation", "exclusion_check")
     
@@ -890,17 +959,7 @@ def build_graph() -> StateGraph:
         "exclusion_check",
         route_after_exclusion,
         {
-            "fraud_detection": "fraud_detection",
-            "senior_review": "senior_review",
-        },
-    )
-
-    # Conditional routing after fraud detection
-    graph.add_conditional_edges(
-        "fraud_detection",
-        route_claim,
-        {
-            "auto_approve": "decision",
+            "decision": "decision",
             "senior_review": "senior_review",
         },
     )
@@ -908,6 +967,7 @@ def build_graph() -> StateGraph:
     # Both decision paths feed into communication
     graph.add_edge("decision", "communication")
     graph.add_edge("senior_review", "communication")
+    graph.add_edge("verification_rejected", "communication")
 
     # Communication is the terminal node
     graph.add_edge("communication", END)
@@ -939,6 +999,22 @@ def process_claim(raw_text: str, initial_data: dict = None) -> ClaimState:
         initial_state.update(initial_data)
         
     result = app.invoke(initial_state)
+
+    # Step 6: Fund deduction on approval
+    try:
+        from customer_db import deduct_fund_balance
+        verification = result.get("verification", {})
+        decision_status = result.get("decision_status")
+
+        if verification.get("passed") and decision_status == "approved":
+            customer_id = verification.get("customer_id")
+            amount = result.get("claim_amount") or result.get("structured_claim", {}).get("claim_amount")
+            if customer_id and amount:
+                deduct_fund_balance(customer_id, float(amount))
+                result.setdefault("trace", []).append(f"[System] Deducted ${amount:,.2f} from {customer_id}")
+    except Exception as e:
+        result.setdefault("trace", []).append(f"[System] Fund deduction skipped: {e}")
+
     return result
 
 

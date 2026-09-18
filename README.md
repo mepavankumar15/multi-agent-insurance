@@ -25,7 +25,7 @@ graph TD
 
 - **Multi-Agent Pipeline**: 6 distinct agents sharing a typed state.
 - **LLM-Powered Data Extraction**: Converts unstructured claims text into structured JSON.
-- **Mock Policy Database**: Simulates backend system validation.
+- **Customer database + policy handbook**: Identity and fund limits come from `customer_db`; exclusions come from `knowledge_base/policy_handbook.pdf`.
 - **Smart Fraud Detection**: Analyzes urgency language, mismatched dates, and limits.
 - **Interactive UI**: A sleek Streamlit application to visualize the agent processing trace and output.
 

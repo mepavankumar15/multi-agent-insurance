@@ -31,6 +31,84 @@ def is_scanned_pdf(file_path: str) -> bool:
         return True # Default to treating as scanned if error occurs
 
 
+def extract_text_from_pdf(file_path: str) -> str:
+    """Extract embedded text from a PDF using pdfplumber."""
+    try:
+        import pdfplumber
+        text_parts = []
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages[:8]:
+                page_text = page.extract_text() or ""
+                if page_text.strip():
+                    text_parts.append(page_text)
+        return "\n".join(text_parts)
+    except Exception as e:
+        print(f"pdfplumber extract failed: {e}")
+        return ""
+
+
+def extract_fields_from_text(text: str) -> dict:
+    """Parse common receipt fields from plain text."""
+    if not text or not text.strip():
+        return {}
+
+    patient_name = None
+    m = re.search(r"(?:^|\n)\s*Name:\s*([A-Za-z][A-Za-z\s.'-]{1,60})", text, re.IGNORECASE)
+    if m:
+        patient_name = m.group(1).strip().split("\n")[0][:80]
+        if patient_name.lower() in {"details", "patient details"}:
+            patient_name = None
+    if not patient_name:
+        m = re.search(
+            r"(?:claimant|patient name)[:\s-]*([A-Za-z][A-Za-z\s.'-]{1,60})",
+            text,
+            re.IGNORECASE,
+        )
+        if m:
+            patient_name = m.group(1).strip().split("\n")[0][:80]
+
+    policy_number = None
+    m = re.search(r"(POL[-\s]?\d{4,8})", text, re.IGNORECASE)
+    if m:
+        policy_number = m.group(1).upper().replace(" ", "")
+
+    treatment_date = None
+    m = re.search(r"(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", text)
+    if m:
+        treatment_date = m.group(1)
+
+    amount = None
+    m = re.search(
+        r"(?:total|amount|charge|fee|hk\$|\$)[:\s]*\$?\s*([\d,]+(?:\.\d{2})?)",
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        try:
+            amount = float(m.group(1).replace(",", ""))
+        except Exception:
+            pass
+
+    diagnosis = None
+    m = re.search(
+        r"(?:diagnosis|treatment|description)[:\s-]*(.+?)(?:\n\n|$)",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        diagnosis = m.group(1).strip()[:300]
+
+    return {
+        "patient_name": patient_name,
+        "policy_number": policy_number,
+        "treatment_date": treatment_date,
+        "diagnosis_or_treatment_description": diagnosis,
+        "amount_charged": amount,
+        "method": "pdf_text",
+        "raw_ocr_text": text[:2000],
+    }
+
+
 def pdf_to_images(file_path: str) -> list:
     """
     Convert a PDF file to a list of PIL Images using PyMuPDF (fitz).
